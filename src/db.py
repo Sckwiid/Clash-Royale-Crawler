@@ -1,21 +1,28 @@
 """
-db.py — Acces base de données Turso (libSQL / SQLite compatible).
-Tous les upserts sont idempotents via INSERT ... ON CONFLICT DO UPDATE.
+db.py — Acces base de donnees Turso via libsql (embedded replica).
+
+Le package "libsql" utilise une API synchrone sqlite3-compatible.
+On l'execute dans un thread executor pour ne pas bloquer asyncio.
+
+Embedded replica = fichier SQLite local synchronise avec Turso :
+  - Lectures : locales (rapide, offline-capable)
+  - Ecritures : envoyees vers Turso via HTTPS
 """
-
 from __future__ import annotations
-
+import asyncio
+import functools
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import libsql_client
-from rich.console import Console
+import libsql
 
 from src import config
 
-console = Console()
-
+_LOCAL_DB = os.path.join(
+    os.path.dirname(__file__), "..", "data", "local_cache", "turso_replica.db"
+)
 
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -23,50 +30,65 @@ def _now_iso() -> str:
 
 class Database:
     """
-    Wrapper async autour du client libSQL (Turso).
-
-    Usage:
-        db = Database()
-        await db.connect()
-        await db.init_schema()
-        ...
-        await db.close()
+    Wrapper async autour de libsql embedded replica Turso.
+    Toutes les methodes publiques sont async.
     """
 
     def __init__(self) -> None:
-        self._client: Optional[libsql_client.Client] = None
+        self._conn: Optional[libsql.Connection] = None
 
     async def connect(self) -> None:
-        self._client = libsql_client.create_client(
-            url=config.TURSO_DATABASE_URL,
-            auth_token=config.TURSO_AUTH_TOKEN,
+        os.makedirs(os.path.dirname(_LOCAL_DB), exist_ok=True)
+        loop = asyncio.get_event_loop()
+        self._conn = await loop.run_in_executor(
+            None,
+            functools.partial(
+                libsql.connect,
+                _LOCAL_DB,
+                sync_url=config.TURSO_DATABASE_URL,
+                auth_token=config.TURSO_AUTH_TOKEN,
+            ),
         )
+        await self._sync()
 
     async def close(self) -> None:
-        if self._client:
-            await self._client.close()
+        if self._conn:
+            await self._sync()
 
-    async def _execute(self, sql: str, args: tuple = ()) -> Any:
-        assert self._client, "Database non connectee — appeler connect() d abord"
-        return await self._client.execute(
-            libsql_client.Statement(sql, list(args))
-        )
+    async def _sync(self) -> None:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._conn.sync)
+
+    async def _execute(self, sql: str, args: tuple = ()) -> tuple[list, Any]:
+        """Execute SQL et retourne (rows, description)."""
+        loop = asyncio.get_event_loop()
+
+        def _do():
+            cur = self._conn.execute(sql, list(args))
+            self._conn.commit()
+            try:
+                rows = cur.fetchall()
+                desc = cur.description
+            except Exception:
+                rows, desc = [], None
+            return rows, desc
+
+        return await loop.run_in_executor(None, _do)
 
     # --- Schema
 
     async def init_schema(self) -> None:
-        """Execute schema.sql pour creer les tables et index."""
         schema_path = Path(__file__).parent.parent / "schema.sql"
         sql = schema_path.read_text(encoding="utf-8")
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         for stmt in statements:
             await self._execute(stmt)
-        console.print("[bold green]Schema initialise avec succes.[/bold green]")
+        await self._sync()
+        print("Schema initialise avec succes.")
 
     # --- Players
 
     async def upsert_player(self, data: dict[str, Any]) -> None:
-        """Insere ou met a jour un joueur. Preserve les donnees importantes existantes."""
         await self._execute(
             """
             INSERT INTO players (
@@ -79,17 +101,7 @@ class Database:
                 discovered_from, discovery_depth,
                 last_profile_scan_at, last_battlelog_scan_at, next_scan_at,
                 updated_at
-            ) VALUES (
-                ?,?,?,?,
-                ?,?,?,?,
-                ?,?,?,?,
-                ?,?,
-                ?,?,
-                ?,?,
-                ?,?,
-                ?,?,?,
-                ?
-            )
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(tag) DO UPDATE SET
                 name                   = COALESCE(excluded.name, name),
                 clan_tag               = COALESCE(excluded.clan_tag, clan_tag),
@@ -127,17 +139,15 @@ class Database:
         )
 
     async def get_player(self, tag: str) -> Optional[dict[str, Any]]:
-        """Recupere un joueur depuis la DB, ou None."""
-        result = await self._execute("SELECT * FROM players WHERE tag = ?", (tag,))
-        if result.rows:
-            cols = [c.name for c in result.columns]
-            return dict(zip(cols, result.rows[0]))
+        rows, desc = await self._execute("SELECT * FROM players WHERE tag = ?", (tag,))
+        if rows and desc:
+            cols = [d[0] for d in desc]
+            return dict(zip(cols, rows[0]))
         return None
 
     # --- Clans
 
     async def upsert_clan(self, data: dict[str, Any]) -> None:
-        """Insere ou met a jour un clan. Idempotent."""
         await self._execute(
             """
             INSERT INTO clans (
@@ -169,51 +179,35 @@ class Database:
 
     async def enqueue_player(self, tag: str, source: str, depth: int, priority: int = 50) -> None:
         await self._execute(
-            """
-            INSERT INTO player_queue (tag, priority, source, depth)
-            VALUES (?,?,?,?)
-            ON CONFLICT(tag) DO NOTHING
-            """,
+            "INSERT INTO player_queue (tag, priority, source, depth) VALUES (?,?,?,?) ON CONFLICT(tag) DO NOTHING",
             (tag, priority, source, depth),
         )
 
     async def enqueue_clan(self, tag: str, source: str, depth: int, priority: int = 50) -> None:
         await self._execute(
-            """
-            INSERT INTO clan_queue (tag, priority, source, depth)
-            VALUES (?,?,?,?)
-            ON CONFLICT(tag) DO NOTHING
-            """,
+            "INSERT INTO clan_queue (tag, priority, source, depth) VALUES (?,?,?,?) ON CONFLICT(tag) DO NOTHING",
             (tag, priority, source, depth),
         )
 
     async def get_next_players(self, limit: int = 10) -> list[dict[str, Any]]:
-        result = await self._execute(
-            """
-            SELECT tag, priority, source, depth, attempts
-            FROM player_queue
-            WHERE next_try_at <= ?
-            ORDER BY priority DESC, next_try_at ASC
-            LIMIT ?
-            """,
+        rows, desc = await self._execute(
+            "SELECT tag, priority, source, depth, attempts FROM player_queue WHERE next_try_at <= ? ORDER BY priority DESC, next_try_at ASC LIMIT ?",
             (_now_iso(), limit),
         )
-        cols = [c.name for c in result.columns]
-        return [dict(zip(cols, row)) for row in result.rows]
+        if not rows or not desc:
+            return []
+        cols = [d[0] for d in desc]
+        return [dict(zip(cols, row)) for row in rows]
 
     async def get_next_clans(self, limit: int = 10) -> list[dict[str, Any]]:
-        result = await self._execute(
-            """
-            SELECT tag, priority, source, depth, attempts
-            FROM clan_queue
-            WHERE next_try_at <= ?
-            ORDER BY priority DESC, next_try_at ASC
-            LIMIT ?
-            """,
+        rows, desc = await self._execute(
+            "SELECT tag, priority, source, depth, attempts FROM clan_queue WHERE next_try_at <= ? ORDER BY priority DESC, next_try_at ASC LIMIT ?",
             (_now_iso(), limit),
         )
-        cols = [c.name for c in result.columns]
-        return [dict(zip(cols, row)) for row in result.rows]
+        if not rows or not desc:
+            return []
+        cols = [d[0] for d in desc]
+        return [dict(zip(cols, row)) for row in rows]
 
     async def remove_player_from_queue(self, tag: str) -> None:
         await self._execute("DELETE FROM player_queue WHERE tag = ?", (tag,))
@@ -223,23 +217,13 @@ class Database:
 
     async def increase_player_attempt(self, tag: str) -> None:
         await self._execute(
-            """
-            UPDATE player_queue
-            SET attempts    = attempts + 1,
-                next_try_at = datetime('now', '+30 minutes')
-            WHERE tag = ?
-            """,
+            "UPDATE player_queue SET attempts = attempts + 1, next_try_at = datetime('now', '+30 minutes') WHERE tag = ?",
             (tag,),
         )
 
     async def increase_clan_attempt(self, tag: str) -> None:
         await self._execute(
-            """
-            UPDATE clan_queue
-            SET attempts    = attempts + 1,
-                next_try_at = datetime('now', '+30 minutes')
-            WHERE tag = ?
-            """,
+            "UPDATE clan_queue SET attempts = attempts + 1, next_try_at = datetime('now', '+30 minutes') WHERE tag = ?",
             (tag,),
         )
 
@@ -269,34 +253,32 @@ class Database:
 
     # --- Stats
 
+    async def _count(self, table: str) -> int:
+        rows, _ = await self._execute(f"SELECT COUNT(*) FROM {table}")
+        return rows[0][0] if rows else 0
+
     async def count_players(self) -> int:
-        result = await self._execute("SELECT COUNT(*) FROM players")
-        return result.rows[0][0] if result.rows else 0
+        return await self._count("players")
 
     async def count_clans(self) -> int:
-        result = await self._execute("SELECT COUNT(*) FROM clans")
-        return result.rows[0][0] if result.rows else 0
+        return await self._count("clans")
 
     async def count_battles(self) -> int:
-        result = await self._execute("SELECT COUNT(*) FROM battle_summaries")
-        return result.rows[0][0] if result.rows else 0
+        return await self._count("battle_summaries")
 
     async def count_player_queue(self) -> int:
-        result = await self._execute("SELECT COUNT(*) FROM player_queue")
-        return result.rows[0][0] if result.rows else 0
+        return await self._count("player_queue")
 
     async def count_clan_queue(self) -> int:
-        result = await self._execute("SELECT COUNT(*) FROM clan_queue")
-        return result.rows[0][0] if result.rows else 0
+        return await self._count("clan_queue")
 
     async def activity_breakdown(self) -> dict[str, int]:
-        result = await self._execute(
+        rows, _ = await self._execute(
             "SELECT activity_status, COUNT(*) FROM players GROUP BY activity_status"
         )
-        return {row[0]: row[1] for row in result.rows}
+        return {row[0]: row[1] for row in rows} if rows else {}
 
     async def update_crawl_stat(self, key: str, value: str) -> None:
         await self._execute(
-            "INSERT INTO crawl_stats (stat_key, stat_value) VALUES (?,?)",
-            (key, value),
+            "INSERT INTO crawl_stats (stat_key, stat_value) VALUES (?,?)", (key, value)
         )

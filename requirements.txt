@@ -4,5 +4,4 @@ boto3>=1.34.0
 orjson>=3.10.0
 rich>=13.7.0
 tenacity>=8.3.0
-libsql-client>=0.3.0
-asyncio-throttle>=1.0.2
+libsql>=0.4.0

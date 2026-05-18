@@ -1,22 +1,14 @@
 """
 crawler.py — Moteur principal du crawler Clash Royale.
 
-Strategie de decouverte (BFS borne par depth et max_players):
-  1. Joueur seed (#GUUR8QP0)
-  2. Battlelog seed -> adversaires + coequipiers
-  3. Clan seed -> membres
-  4. Battlelogs membres -> nouveaux joueurs
-  5. Clans joueurs decouverts -> leurs membres
-  6. Repetition jusqu a CRAWL_MAX_DEPTH / CRAWL_MAX_PLAYERS
+Decouverte BFS:
+  seed -> battlelog -> clan -> membres -> battlelogs membres -> ...
+  Borne par CRAWL_MAX_DEPTH et CRAWL_MAX_PLAYERS.
 
-Robustesse:
-  - Queues persistees dans Turso -> reprise apres arret sans repartir de zero
-  - Upserts idempotents -> pas de doublons
-  - Erreurs isolees par joueur/clan -> pas de crash global
+Reprise: les queues sont persistees dans Turso.
+Ctrl+C arrete proprement, relancer reprend ou ca s'est arrete.
 """
-
 from __future__ import annotations
-
 import asyncio
 import time
 from datetime import datetime, timezone
@@ -31,11 +23,8 @@ from src.clash_api import ClashRoyaleAPI, ClashAPIError
 from src.db import Database
 from src.r2_storage import R2Storage
 from src.normalize import (
-    normalize_tag,
-    safe_tag_for_path,
-    extract_tags_from_battlelog,
-    deck_hash,
-    make_battle_id,
+    normalize_tag, safe_tag_for_path,
+    extract_tags_from_battlelog, deck_hash, make_battle_id,
 )
 from src.classifier import classify_player
 from src.utils import run_with_semaphore
@@ -44,19 +33,13 @@ console = Console()
 
 
 class Crawler:
-    """
-    Crawler async Clash Royale.
-    Peut etre arrete (Ctrl+C) et relance sans perte de donnees.
-    """
-
     def __init__(self) -> None:
-        self.db  = Database()
-        self.r2: Optional[R2Storage] = R2Storage() if config.STORE_RAW_JSON else None
+        self.db         = Database()
+        self.r2         = R2Storage() if config.STORE_RAW_JSON else None
         self._semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
         self._api: Optional[ClashRoyaleAPI] = None
 
     async def run(self) -> None:
-        """Point d entree : initialise et lance la boucle principale."""
         await self.db.connect()
         console.print("[bold cyan]Clash Royale Crawler demarre[/bold cyan]")
         console.print(f"  Seed       : [green]{config.SEED_PLAYER_TAG}[/green]")
@@ -76,11 +59,8 @@ class Crawler:
         await self.db.close()
         console.print("[bold green]Crawler termine.[/bold green]")
 
-    # --- Boucle principale
-
     async def _main_loop(self) -> None:
         last_stats = 0.0
-
         while True:
             total = await self.db.count_players()
             if total >= config.CRAWL_MAX_PLAYERS:
@@ -95,14 +75,10 @@ class Crawler:
                 await asyncio.sleep(30)
                 continue
 
-            tasks = [
-                run_with_semaphore(self._semaphore, self._scan_player, item["tag"], item["depth"])
-                for item in player_batch
-            ] + [
-                run_with_semaphore(self._semaphore, self._scan_clan, item["tag"], item["depth"])
-                for item in clan_batch
-            ]
-
+            tasks = (
+                [run_with_semaphore(self._semaphore, self._scan_player, i["tag"], i["depth"]) for i in player_batch] +
+                [run_with_semaphore(self._semaphore, self._scan_clan,   i["tag"], i["depth"]) for i in clan_batch]
+            )
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
                 if isinstance(r, Exception):
@@ -113,8 +89,6 @@ class Crawler:
                 await self._print_stats()
                 last_stats = now
 
-    # --- Scan joueur
-
     async def _scan_player(self, tag: str, depth: int) -> None:
         tag  = normalize_tag(tag)
         safe = safe_tag_for_path(tag)
@@ -122,7 +96,6 @@ class Crawler:
 
         old_profile = await self.db.get_player(tag)
 
-        # Profil
         try:
             profile = await self._api.get_player(tag)
         except ClashAPIError:
@@ -134,24 +107,19 @@ class Crawler:
             await self.db.remove_player_from_queue(tag)
             return
 
-        # Raw JSON profil -> R2
         if self.r2:
             try:
                 self.r2.put_json_gz(self.r2.player_key(safe), profile)
-            except Exception as exc:
-                console.print(f"[yellow]R2 profil skip ({tag}): {exc}[/yellow]")
+            except Exception:
+                pass
 
-        # Enqueue clan du joueur
         clan_info = profile.get("clan") or {}
         if clan_info.get("tag") and depth + 1 <= config.CRAWL_MAX_DEPTH:
             await self.db.enqueue_clan(
                 normalize_tag(clan_info["tag"]),
-                source=f"player:{tag}",
-                depth=depth + 1,
-                priority=70,
+                source=f"player:{tag}", depth=depth + 1, priority=70,
             )
 
-        # Battlelog
         battlelog = None
         battlelog_r2_key: Optional[str] = None
         try:
@@ -165,29 +133,18 @@ class Crawler:
                     battlelog_r2_key = self.r2.put_json_gz(self.r2.battlelog_key(safe), battlelog)
                 except Exception:
                     pass
-
-            # Decouverte joueurs via battlelog
             if depth + 1 <= config.CRAWL_MAX_DEPTH:
                 for dtag in extract_tags_from_battlelog(battlelog):
                     if dtag != tag:
                         await self.db.enqueue_player(
-                            dtag,
-                            source=f"battlelog:{tag}",
-                            depth=depth + 1,
-                            priority=60,
+                            dtag, source=f"battlelog:{tag}", depth=depth + 1, priority=60,
                         )
-
             await self._insert_battles(tag, battlelog, battlelog_r2_key)
 
-        # Classifier + upsert
         now_iso        = datetime.now(tz=timezone.utc).isoformat()
-        classification = classify_player(
-            new_profile=profile,
-            old_profile=old_profile,
-            battlelog=battlelog,
-        )
+        classification = classify_player(new_profile=profile, old_profile=old_profile, battlelog=battlelog)
+        arena          = profile.get("arena") or {}
 
-        arena = profile.get("arena") or {}
         await self.db.upsert_player({
             "tag":                   tag,
             "name":                  profile.get("name"),
@@ -212,45 +169,35 @@ class Crawler:
             "last_battlelog_scan_at": now_iso if battlelog is not None else None,
             "discovery_depth":       depth,
         })
-
         await self.db.remove_player_from_queue(tag)
-        console.print(
-            f"[green]{tag} -> {classification['activity_status']} "
-            f"(score={classification['activity_score']})[/green]"
-        )
+        console.print(f"[green]{tag} -> {classification['activity_status']} (score={classification['activity_score']})[/green]")
 
-    async def _insert_battles(
-        self, player_tag: str, battlelog: list, r2_key: Optional[str]
-    ) -> None:
+    async def _insert_battles(self, player_tag: str, battlelog: list, r2_key: Optional[str]) -> None:
         for battle in battlelog:
             team     = battle.get("team", [])
             opponent = battle.get("opponent", [])
             if not team or not opponent:
                 continue
-
-            p_side = team[0]
-            o_side = opponent[0]
-            pc     = p_side.get("crowns", 0)
-            oc     = o_side.get("crowns", 0)
+            p = team[0]
+            o = opponent[0]
+            pc = p.get("crowns", 0)
+            oc = o.get("crowns", 0)
             result = "win" if pc > oc else ("loss" if pc < oc else "draw")
-            gm     = battle.get("gameMode") or {}
-
+            gm = battle.get("gameMode") or {}
             await self.db.insert_battle_summary({
                 "battle_id":          make_battle_id(battle, player_tag),
                 "battle_time":        battle.get("battleTime"),
                 "battle_type":        battle.get("type"),
                 "game_mode":          gm.get("name"),
                 "player_tag":         player_tag,
-                "opponent_tag":       normalize_tag(o_side.get("tag", "")),
+                "opponent_tag":       normalize_tag(o.get("tag", "")),
                 "player_crowns":      pc,
                 "opponent_crowns":    oc,
                 "result":             result,
-                "player_deck_hash":   deck_hash(p_side.get("cards", [])),
-                "opponent_deck_hash": deck_hash(o_side.get("cards", [])),
+                "player_deck_hash":   deck_hash(p.get("cards", [])),
+                "opponent_deck_hash": deck_hash(o.get("cards", [])),
                 "raw_r2_key":         r2_key,
             })
-
-    # --- Scan clan
 
     async def _scan_clan(self, clan_tag: str, depth: int) -> None:
         clan_tag = normalize_tag(clan_tag)
@@ -262,7 +209,6 @@ class Crawler:
         except ClashAPIError:
             await self.db.increase_clan_attempt(clan_tag)
             return
-
         if clan is None:
             await self.db.remove_clan_from_queue(clan_tag)
             return
@@ -298,13 +244,12 @@ class Crawler:
             "discovery_depth":      depth,
         })
 
-        # Enqueue membres
         if members and depth + 1 <= config.CRAWL_MAX_DEPTH:
             for member in members:
                 mtag = member.get("tag")
                 if not mtag:
                     continue
-                mtag = normalize_tag(mtag)
+                mtag    = normalize_tag(mtag)
                 classif = classify_player(
                     new_profile={"lastSeen": member.get("lastSeen")},
                     clan_member=member,
@@ -330,32 +275,23 @@ class Crawler:
 
         await self.db.remove_clan_from_queue(clan_tag)
         nb = len(members) if members else 0
-        console.print(f"[green]Clan {clan_tag} OK — {nb} membres enqueues[/green]")
-
-    # --- Stats console
+        console.print(f"[green]Clan {clan_tag} OK — {nb} membres[/green]")
 
     async def _print_stats(self) -> None:
-        n_p  = await self.db.count_players()
-        n_c  = await self.db.count_clans()
-        n_b  = await self.db.count_battles()
-        n_pq = await self.db.count_player_queue()
-        n_cq = await self.db.count_clan_queue()
-
         t = Table(title="Crawl Stats", box=box.ROUNDED)
         t.add_column("Metrique", style="cyan")
         t.add_column("Valeur", style="bold white")
-        t.add_row("Joueurs", str(n_p))
-        t.add_row("Clans",   str(n_c))
-        t.add_row("Batailles", str(n_b))
-        t.add_row("Queue joueurs", str(n_pq))
-        t.add_row("Queue clans",   str(n_cq))
+        t.add_row("Joueurs",       str(await self.db.count_players()))
+        t.add_row("Clans",         str(await self.db.count_clans()))
+        t.add_row("Batailles",     str(await self.db.count_battles()))
+        t.add_row("Queue joueurs", str(await self.db.count_player_queue()))
+        t.add_row("Queue clans",   str(await self.db.count_clan_queue()))
         console.print(t)
-
-        breakdown = await self.db.activity_breakdown()
-        if breakdown:
+        bd = await self.db.activity_breakdown()
+        if bd:
             t2 = Table(title="Activite", box=box.SIMPLE)
             t2.add_column("Status")
             t2.add_column("Count")
-            for status, count in sorted(breakdown.items()):
-                t2.add_row(status, str(count))
+            for s, c in sorted(bd.items()):
+                t2.add_row(s, str(c))
             console.print(t2)
