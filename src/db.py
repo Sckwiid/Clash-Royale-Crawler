@@ -1,14 +1,16 @@
 """
-db.py — Acces base de donnees Turso via libsql (embedded replica).
+db.py — Acces Turso via libsql-experimental (embedded replica).
 
-Le package "libsql" utilise une API synchrone sqlite3-compatible.
-On l'execute dans un thread executor pour ne pas bloquer asyncio.
+Le package s'appelle libsql-experimental sur PyPI
+mais s'importe avec : import libsql_experimental as libsql
 
 Embedded replica = fichier SQLite local synchronise avec Turso :
-  - Lectures : locales (rapide, offline-capable)
-  - Ecritures : envoyees vers Turso via HTTPS
+  - Lectures locales ultra-rapides
+  - Ecritures envoyees vers Turso via HTTPS
+  - Fonctionne meme sans connexion (mode degraded)
 """
 from __future__ import annotations
+
 import asyncio
 import functools
 import os
@@ -16,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import libsql
+import libsql_experimental as libsql
 
 from src import config
 
@@ -24,18 +26,16 @@ _LOCAL_DB = os.path.join(
     os.path.dirname(__file__), "..", "data", "local_cache", "turso_replica.db"
 )
 
+
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
 class Database:
-    """
-    Wrapper async autour de libsql embedded replica Turso.
-    Toutes les methodes publiques sont async.
-    """
+    """Wrapper async autour de libsql-experimental (Turso embedded replica)."""
 
     def __init__(self) -> None:
-        self._conn: Optional[libsql.Connection] = None
+        self._conn: Optional[Any] = None
 
     async def connect(self) -> None:
         os.makedirs(os.path.dirname(_LOCAL_DB), exist_ok=True)
@@ -60,7 +60,6 @@ class Database:
         await loop.run_in_executor(None, self._conn.sync)
 
     async def _execute(self, sql: str, args: tuple = ()) -> tuple[list, Any]:
-        """Execute SQL et retourne (rows, description)."""
         loop = asyncio.get_event_loop()
 
         def _do():
@@ -75,7 +74,7 @@ class Database:
 
         return await loop.run_in_executor(None, _do)
 
-    # --- Schema
+    # ── Schema ────────────────────────────────────────────────────────────────
 
     async def init_schema(self) -> None:
         schema_path = Path(__file__).parent.parent / "schema.sql"
@@ -84,9 +83,9 @@ class Database:
         for stmt in statements:
             await self._execute(stmt)
         await self._sync()
-        print("Schema initialise avec succes.")
+        print("[DB] Schema initialise avec succes.")
 
-    # --- Players
+    # ── Players ───────────────────────────────────────────────────────────────
 
     async def upsert_player(self, data: dict[str, Any]) -> None:
         await self._execute(
@@ -145,7 +144,7 @@ class Database:
             return dict(zip(cols, rows[0]))
         return None
 
-    # --- Clans
+    # ── Clans ─────────────────────────────────────────────────────────────────
 
     async def upsert_clan(self, data: dict[str, Any]) -> None:
         await self._execute(
@@ -175,7 +174,7 @@ class Database:
             ),
         )
 
-    # --- Queues
+    # ── Queues ────────────────────────────────────────────────────────────────
 
     async def enqueue_player(self, tag: str, source: str, depth: int, priority: int = 50) -> None:
         await self._execute(
@@ -227,7 +226,7 @@ class Database:
             (tag,),
         )
 
-    # --- Battle summaries
+    # ── Battles ───────────────────────────────────────────────────────────────
 
     async def insert_battle_summary(self, data: dict[str, Any]) -> None:
         await self._execute(
@@ -251,7 +250,7 @@ class Database:
             ),
         )
 
-    # --- Stats
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def _count(self, table: str) -> int:
         rows, _ = await self._execute(f"SELECT COUNT(*) FROM {table}")
