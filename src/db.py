@@ -63,7 +63,7 @@ class Database:
         loop = asyncio.get_event_loop()
 
         def _do():
-            cur = self._conn.execute(sql, list(args))
+            cur = self._conn.execute(sql, tuple(args))
             self._conn.commit()
             try:
                 rows = cur.fetchall()
