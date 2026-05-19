@@ -1,29 +1,25 @@
 """
-db.py — Acces Turso via libsql-experimental (embedded replica).
+db.py — SQLite local via aiosqlite.
 
-Le package s'appelle libsql-experimental sur PyPI
-mais s'importe avec : import libsql_experimental as libsql
+Remplace libsql_experimental qui droppait la connexion Turso toutes les ~30 min.
+Les données vivent dans data/local_cache/crawler.db sur le serveur.
+Zéro réseau, zéro timeout, zéro stream not found.
 
-Embedded replica = fichier SQLite local synchronise avec Turso :
-  - Lectures locales ultra-rapides
-  - Ecritures envoyees vers Turso via HTTPS
-  - Fonctionne meme sans connexion (mode degraded)
+Pour exporter vers Turso plus tard :
+    sqlite3 data/local_cache/crawler.db .dump > dump.sql
+    turso db shell <name> < dump.sql
 """
 from __future__ import annotations
 
-import asyncio
-import functools
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import libsql_experimental as libsql
+import aiosqlite
 
-from src import config
-
-_LOCAL_DB = os.path.join(
-    os.path.dirname(__file__), "..", "data", "local_cache", "turso_replica.db"
+_DB_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "data", "local_cache", "crawler.db"
 )
 
 
@@ -32,47 +28,29 @@ def _now_iso() -> str:
 
 
 class Database:
-    """Wrapper async autour de libsql-experimental (Turso embedded replica)."""
+    """Wrapper async SQLite via aiosqlite. Zero reseau, zero timeout."""
 
     def __init__(self) -> None:
-        self._conn: Optional[Any] = None
+        self._conn: Optional[aiosqlite.Connection] = None
 
     async def connect(self) -> None:
-        os.makedirs(os.path.dirname(_LOCAL_DB), exist_ok=True)
-        loop = asyncio.get_event_loop()
-        self._conn = await loop.run_in_executor(
-            None,
-            functools.partial(
-                libsql.connect,
-                _LOCAL_DB,
-                sync_url=config.TURSO_DATABASE_URL,
-                auth_token=config.TURSO_AUTH_TOKEN,
-            ),
-        )
-        await self._sync()
+        os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+        self._conn = await aiosqlite.connect(_DB_PATH)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
+        await self._conn.execute("PRAGMA cache_size=-64000")
+        await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
-            await self._sync()
+            await self._conn.close()
 
-    async def _sync(self) -> None:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._conn.sync)
-
-    async def _execute(self, sql: str, args: tuple = ()) -> tuple[list, Any]:
-        loop = asyncio.get_event_loop()
-
-        def _do():
-            cur = self._conn.execute(sql, tuple(args))
-            self._conn.commit()
-            try:
-                rows = cur.fetchall()
-                desc = cur.description
-            except Exception:
-                rows, desc = [], None
-            return rows, desc
-
-        return await loop.run_in_executor(None, _do)
+    async def _execute(self, sql: str, args: tuple = ()) -> aiosqlite.Cursor:
+        assert self._conn, "Database non connectee"
+        cur = await self._conn.execute(sql, args)
+        await self._conn.commit()
+        return cur
 
     # ── Schema ────────────────────────────────────────────────────────────────
 
@@ -81,8 +59,8 @@ class Database:
         sql = schema_path.read_text(encoding="utf-8")
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         for stmt in statements:
-            await self._execute(stmt)
-        await self._sync()
+            await self._conn.execute(stmt)
+        await self._conn.commit()
         print("[DB] Schema initialise avec succes.")
 
     # ── Players ───────────────────────────────────────────────────────────────
@@ -138,11 +116,9 @@ class Database:
         )
 
     async def get_player(self, tag: str) -> Optional[dict[str, Any]]:
-        rows, desc = await self._execute("SELECT * FROM players WHERE tag = ?", (tag,))
-        if rows and desc:
-            cols = [d[0] for d in desc]
-            return dict(zip(cols, rows[0]))
-        return None
+        cur = await self._execute("SELECT * FROM players WHERE tag = ?", (tag,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
     # ── Clans ─────────────────────────────────────────────────────────────────
 
@@ -189,24 +165,22 @@ class Database:
         )
 
     async def get_next_players(self, limit: int = 10) -> list[dict[str, Any]]:
-        rows, desc = await self._execute(
-            "SELECT tag, priority, source, depth, attempts FROM player_queue WHERE next_try_at <= ? ORDER BY priority DESC, next_try_at ASC LIMIT ?",
+        cur = await self._execute(
+            "SELECT tag, priority, source, depth, attempts FROM player_queue "
+            "WHERE next_try_at <= ? ORDER BY priority DESC, next_try_at ASC LIMIT ?",
             (_now_iso(), limit),
         )
-        if not rows or not desc:
-            return []
-        cols = [d[0] for d in desc]
-        return [dict(zip(cols, row)) for row in rows]
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def get_next_clans(self, limit: int = 10) -> list[dict[str, Any]]:
-        rows, desc = await self._execute(
-            "SELECT tag, priority, source, depth, attempts FROM clan_queue WHERE next_try_at <= ? ORDER BY priority DESC, next_try_at ASC LIMIT ?",
+        cur = await self._execute(
+            "SELECT tag, priority, source, depth, attempts FROM clan_queue "
+            "WHERE next_try_at <= ? ORDER BY priority DESC, next_try_at ASC LIMIT ?",
             (_now_iso(), limit),
         )
-        if not rows or not desc:
-            return []
-        cols = [d[0] for d in desc]
-        return [dict(zip(cols, row)) for row in rows]
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def remove_player_from_queue(self, tag: str) -> None:
         await self._execute("DELETE FROM player_queue WHERE tag = ?", (tag,))
@@ -216,13 +190,15 @@ class Database:
 
     async def increase_player_attempt(self, tag: str) -> None:
         await self._execute(
-            "UPDATE player_queue SET attempts = attempts + 1, next_try_at = datetime('now', '+30 minutes') WHERE tag = ?",
+            "UPDATE player_queue SET attempts = attempts + 1, "
+            "next_try_at = datetime('now', '+30 minutes') WHERE tag = ?",
             (tag,),
         )
 
     async def increase_clan_attempt(self, tag: str) -> None:
         await self._execute(
-            "UPDATE clan_queue SET attempts = attempts + 1, next_try_at = datetime('now', '+30 minutes') WHERE tag = ?",
+            "UPDATE clan_queue SET attempts = attempts + 1, "
+            "next_try_at = datetime('now', '+30 minutes') WHERE tag = ?",
             (tag,),
         )
 
@@ -253,8 +229,9 @@ class Database:
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def _count(self, table: str) -> int:
-        rows, _ = await self._execute(f"SELECT COUNT(*) FROM {table}")
-        return rows[0][0] if rows else 0
+        cur = await self._execute(f"SELECT COUNT(*) FROM {table}")
+        row = await cur.fetchone()
+        return row[0] if row else 0
 
     async def count_players(self) -> int:
         return await self._count("players")
@@ -272,9 +249,10 @@ class Database:
         return await self._count("clan_queue")
 
     async def activity_breakdown(self) -> dict[str, int]:
-        rows, _ = await self._execute(
+        cur = await self._execute(
             "SELECT activity_status, COUNT(*) FROM players GROUP BY activity_status"
         )
+        rows = await cur.fetchall()
         return {row[0]: row[1] for row in rows} if rows else {}
 
     async def update_crawl_stat(self, key: str, value: str) -> None:
